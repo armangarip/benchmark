@@ -23,7 +23,7 @@ using namespace llvm;
 int readNValue(std::string matrixName) {
     int n;
     std::ifstream infoFile;
-    infoFile.open("../" + matrixName + "/" + matrixName + "_CSRbyNZ/info.csv");
+    infoFile.open("data/" + matrixName + "/" + matrixName + "_CSRbyNZ/info.csv");
     std::string token;
     while(getline(infoFile, token, ',')) {
         if(token == " n") {
@@ -79,7 +79,7 @@ int main(int argc, char** argv) {
     SMDiagnostic diag;
 
     std::unique_ptr<Module> Owner = parseIRFile(
-            "../" + matrixName + "/" + matrixName + "_" + specType + "/generated_merged.ll", diag, Context);
+            "data/" + matrixName + "/" + matrixName + "_" + specType + "/generated_merged.ll", diag, Context);
     if (!Owner) {
         errs() << "No such matrix";
         return 1;
