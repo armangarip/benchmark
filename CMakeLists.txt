@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.3)
-project(benchmark2)
+project(benchmark)
 
 message(STATUS ${llvm_libs})
 
@@ -11,14 +11,15 @@ add_definitions(${LLVM_DEFINITIONS})
 
 set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -O3 -fno-rtti -std=c++11" )
 
-set(dir ${CMAKE_CURRENT_SOURCE_DIR})
+set(dir ${CMAKE_CURRENT_DIR})
 set(CMAKE_RUNTIME_OUTPUT_DIRECTORY "${dir}")
 
 
-set(SOURCE_FILES main.cpp)
-add_executable(benchmark2 ${SOURCE_FILES})
+add_executable(lli-benchmark lli-main.cpp)
+add_executable(llc-benchmark llc-main.cpp)
 
 llvm_map_components_to_libnames(llvm_libs all)
 
-target_link_libraries(benchmark2 ${llvm_libs})
+target_link_libraries(lli-benchmark ${llvm_libs})
+target_link_libraries(llc-benchmark ${llvm_libs})
 
