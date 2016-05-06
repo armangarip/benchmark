@@ -50,12 +50,40 @@
 #include "llvm/Target/TargetSubtargetInfo.h"
 #include <memory>
 
+#include "llvm/ADT/StringMap.h"
+#include "llvm/DebugInfo/DIContext.h"
+#include "llvm/DebugInfo/DWARF/DWARFContext.h"
+#include "llvm/ExecutionEngine/RTDyldMemoryManager.h"
+#include "llvm/ExecutionEngine/RuntimeDyld.h"
+#include "llvm/ExecutionEngine/RuntimeDyldChecker.h"
+#include "llvm/MC/MCAsmInfo.h"
+#include "llvm/MC/MCContext.h"
+#include "llvm/MC/MCDisassembler.h"
+#include "llvm/MC/MCInstPrinter.h"
+#include "llvm/MC/MCInstrInfo.h"
+#include "llvm/MC/MCRegisterInfo.h"
+#include "llvm/MC/MCSubtargetInfo.h"
+#include "llvm/Object/MachO.h"
+#include "llvm/Object/SymbolSize.h"
+#include "llvm/Support/CommandLine.h"
+#include "llvm/Support/DynamicLibrary.h"
+#include "llvm/Support/ManagedStatic.h"
+#include "llvm/Support/Memory.h"
+#include "llvm/Support/MemoryBuffer.h"
+#include "llvm/Support/PrettyStackTrace.h"
+#include "llvm/Support/Signals.h"
+#include "llvm/Support/TargetRegistry.h"
+#include "llvm/Support/TargetSelect.h"
+#include "llvm/Support/raw_ostream.h"
+
+
 using namespace llvm;
+using namespace llvm::object;
 
 int readNValue(std::string matrixName) {
     int n;
     std::ifstream infoFile;
-    infoFile.open("../" + matrixName + "/" + matrixName + "_CSRbyNZ/info.csv");
+    infoFile.open("data/" + matrixName + "/" + matrixName + "_CSRbyNZ/info.csv");
     std::string token;
     while(getline(infoFile, token, ',')) {
         if(token == " n") {
@@ -67,73 +95,81 @@ int readNValue(std::string matrixName) {
     return 0;
 }
 
-static std::unique_ptr<tool_output_file>
-GetOutputStream(const char *TargetName, Triple::OSType OS,
-                const char *ProgName, std::string InputFilename) {
-    // If we don't yet have an output filename, make one.
-    std::string OutputFilename;
-    if (OutputFilename.empty()) {
-        if (InputFilename == "-")
-            OutputFilename = "-";
-        else {
-            // If InputFilename ends in .bc or .ll, remove it.
-            StringRef IFN = InputFilename;
-            if (IFN.endswith(".bc") || IFN.endswith(".ll"))
-                OutputFilename = IFN.drop_back(3);
-            else if (IFN.endswith(".mir"))
-                OutputFilename = IFN.drop_back(4);
-            else
-                OutputFilename = IFN;
-
-            switch (FileType) {
-                case TargetMachine::CGFT_AssemblyFile:
-                    if (TargetName[0] == 'c') {
-                        if (TargetName[1] == 0)
-                            OutputFilename += ".cbe.c";
-                        else if (TargetName[1] == 'p' && TargetName[2] == 'p')
-                            OutputFilename += ".cpp";
-                        else
-                            OutputFilename += ".s";
-                    } else
-                        OutputFilename += ".s";
-                    break;
-                case TargetMachine::CGFT_ObjectFile:
-                    if (OS == Triple::Win32)
-                        OutputFilename += ".obj";
-                    else
-                        OutputFilename += ".o";
-                    break;
-                case TargetMachine::CGFT_Null:
-                    OutputFilename += ".null";
-                    break;
-            }
-        }
-    }
-
-    // Decide if we need "binary" output.
-    bool Binary = false;
-    switch (FileType) {
-        case TargetMachine::CGFT_AssemblyFile:
-            break;
-        case TargetMachine::CGFT_ObjectFile:
-        case TargetMachine::CGFT_Null:
-            Binary = true;
-            break;
-    }
-
-    // Open the file.
-    std::error_code EC;
-    sys::fs::OpenFlags OpenFlags = sys::fs::F_None;
-    if (!Binary)
-        OpenFlags |= sys::fs::F_Text;
-    auto FDOut = llvm::make_unique<tool_output_file>(OutputFilename, EC,
-                                                     OpenFlags);
-    if (EC) {
-        errs() << EC.message() << '\n';
+// A trivial memory manager that doesn't do anything fancy, just uses the
+// support library allocation routines directly.
+class TrivialMemoryManager : public RTDyldMemoryManager {
+public:
+    SmallVector<sys::MemoryBlock, 16> FunctionMemory;
+    SmallVector<sys::MemoryBlock, 16> DataMemory;
+    
+    uint8_t *allocateCodeSection(uintptr_t Size, unsigned Alignment,
+                                 unsigned SectionID,
+                                 StringRef SectionName) override;
+    uint8_t *allocateDataSection(uintptr_t Size, unsigned Alignment,
+                                 unsigned SectionID, StringRef SectionName,
+                                 bool IsReadOnly) override;
+    
+    void *getPointerToNamedFunction(const std::string &Name,
+                                    bool AbortOnFailure = true) override {
         return nullptr;
     }
+    
+    bool finalizeMemory(std::string *ErrMsg) override { return false; }
+    
+    // Invalidate instruction cache for sections with execute permissions.
+    // Some platforms with separate data cache and instruction cache require
+    // explicit cache flush, otherwise JIT code manipulations (like resolved
+    // relocations) will get to the data cache but not to the instruction cache.
+    virtual void invalidateInstructionCache();
+    
+    void addDummySymbol(const std::string &Name, uint64_t Addr) {
+        DummyExterns[Name] = Addr;
+    }
+    
+    RuntimeDyld::SymbolInfo findSymbol(const std::string &Name) override {
+        auto I = DummyExterns.find(Name);
+        
+        if (I != DummyExterns.end())
+            return RuntimeDyld::SymbolInfo(I->second, JITSymbolFlags::Exported);
+            
+            return RTDyldMemoryManager::findSymbol(Name);
+            }
+    
+    void registerEHFrames(uint8_t *Addr, uint64_t LoadAddr,
+                          size_t Size) override {}
+    void deregisterEHFrames(uint8_t *Addr, uint64_t LoadAddr,
+                            size_t Size) override {}
+private:
+    std::map<std::string, uint64_t> DummyExterns;
+};
 
-    return FDOut;
+uint8_t *TrivialMemoryManager::allocateCodeSection(uintptr_t Size,
+                                                   unsigned Alignment,
+                                                   unsigned SectionID,
+                                                   StringRef SectionName) {
+    sys::MemoryBlock MB = sys::Memory::AllocateRWX(Size, nullptr, nullptr);
+    FunctionMemory.push_back(MB);
+    return (uint8_t*)MB.base();
+}
+
+uint8_t *TrivialMemoryManager::allocateDataSection(uintptr_t Size,
+                                                   unsigned Alignment,
+                                                   unsigned SectionID,
+                                                   StringRef SectionName,
+                                                   bool IsReadOnly) {
+    sys::MemoryBlock MB = sys::Memory::AllocateRWX(Size, nullptr, nullptr);
+    DataMemory.push_back(MB);
+    return (uint8_t*)MB.base();
+}
+
+void TrivialMemoryManager::invalidateInstructionCache() {
+    for (int i = 0, e = FunctionMemory.size(); i != e; ++i)
+        sys::Memory::InvalidateInstructionCache(FunctionMemory[i].base(),
+                                                FunctionMemory[i].size());
+    
+    for (int i = 0, e = DataMemory.size(); i != e; ++i)
+        sys::Memory::InvalidateInstructionCache(DataMemory[i].base(),
+                                                DataMemory[i].size());
 }
 
 int main(int argc, char** argv) {
@@ -143,10 +179,8 @@ int main(int argc, char** argv) {
         return 1;
     }
 
-    FileType = TargetMachine::CGFT_ObjectFile;
-
     std::string matrixName = argv[1];
-//    outs() << "Running benchmarks on " << matrixName << ".\n";
+    outs() << "Running benchmarks on " << matrixName << ".\n";
 
     InitializeNativeTarget();
     InitializeAllTargetMCs();
@@ -157,22 +191,20 @@ int main(int argc, char** argv) {
     SMDiagnostic diag;
     std::unique_ptr<MIRParser> MIR;
 
-
-    std::string filePath = "../" + matrixName + "/" + matrixName + "_CSRbyNZ/generated_merged.ll";
-
+    std::string filePath = "data/" + matrixName + "/" + matrixName + "_CSRbyNZ/generated_merged.ll";
     std::unique_ptr<Module> M = parseIRFile(filePath, diag, Context);
     if (!M) {
         errs() << "No such matrix";
         return 1;
     }
 
-    //begin llc-like implementation
+    // Begin LLC-like implementation
     if (verifyModule(*M, &errs())) {
         errs() << argv[0] << ": " << filePath
         << ": error: input module is broken!\n";
         return 1;
     }
-
+    
     Triple TheTriple = Triple(M->getTargetTriple());
 
     std::string Error;
@@ -182,16 +214,7 @@ int main(int argc, char** argv) {
     std::string CPUStr = getCPUStr(), FeaturesStr = getFeaturesStr();
 
     CodeGenOpt::Level OLvl = CodeGenOpt::Default;
-    switch ('0') {
-        default:
-            errs() << argv[0] << ": invalid optimization level.\n";
-            return 1;
-        case ' ': break;
-        case '0': OLvl = CodeGenOpt::None; break;
-        case '1': OLvl = CodeGenOpt::Less; break;
-        case '2': OLvl = CodeGenOpt::Default; break;
-        case '3': OLvl = CodeGenOpt::Aggressive; break;
-    }
+    FileType = TargetMachine::CGFT_ObjectFile;
 
     TargetOptions Options = InitTargetOptionsFromCodeGenFlags();
 //    Options.DisableIntegratedAS = NoIntegratedAssembler;
@@ -205,11 +228,8 @@ int main(int argc, char** argv) {
 
     assert(Target && "Could not allocate target machine!");
 
-    std::unique_ptr<tool_output_file> Out =
-            GetOutputStream(TheTarget->getName(), TheTriple.getOS(), argv[0], matrixName);
-    if (!Out) return 1;
-
     legacy::PassManager PM;
+
 
     TargetLibraryInfoImpl TLII(Triple(M->getTargetTriple()));
 
@@ -222,80 +242,111 @@ int main(int argc, char** argv) {
         M->setDataLayout(*DL);
 
     setFunctionAttributes(CPUStr, FeaturesStr, *M);
-
-
-    if (RelaxAll.getNumOccurrences() > 0 &&
-        FileType != TargetMachine::CGFT_ObjectFile)
-        errs() << argv[0]
-        << ": warning: ignoring -mc-relax-all because filetype != obj";
-
-    {
-        SmallVector<char, 1024*1024*4> *smallVector = new SmallVector<char, 1024*1024*4>();
-        raw_svector_ostream svectorOS(*smallVector);
-
-        FileType = TargetMachine::CGFT_ObjectFile;
-
-        raw_pwrite_stream *OS = &svectorOS;
-        std::unique_ptr<buffer_ostream> BOS;
-        if (FileType != TargetMachine::CGFT_AssemblyFile &&
-            !Out->os().supportsSeeking()) {
-            BOS = make_unique<buffer_ostream>(*OS);
-            OS = BOS.get();
-        }
-
-        AnalysisID StartBeforeID = nullptr;
-        AnalysisID StartAfterID = nullptr;
-        AnalysisID StopAfterID = nullptr;
-        const PassRegistry *PR = PassRegistry::getPassRegistry();
-        if (!RunPass.empty()) {
-            if (!StartAfter.empty() || !StopAfter.empty()) {
-                errs() << argv[0] << ": start-after and/or stop-after passes are "
-                        "redundant when run-pass is specified.\n";
-                return 1;
-            }
-            const PassInfo *PI = PR->getPassInfo(RunPass);
-            if (!PI) {
-                errs() << argv[0] << ": run-pass pass is not registered.\n";
-                return 1;
-            }
-            StopAfterID = StartBeforeID = PI->getTypeInfo();
-        } else {
-            if (!StartAfter.empty()) {
-                const PassInfo *PI = PR->getPassInfo(StartAfter);
-                if (!PI) {
-                    errs() << argv[0] << ": start-after pass is not registered.\n";
-                    return 1;
-                }
-                StartAfterID = PI->getTypeInfo();
-            }
-            if (!StopAfter.empty()) {
-                const PassInfo *PI = PR->getPassInfo(StopAfter);
-                if (!PI) {
-                    errs() << argv[0] << ": stop-after pass is not registered.\n";
-                    return 1;
-                }
-                StopAfterID = PI->getTypeInfo();
-            }
-        }
-
-        // Ask the target to add backend passes as necessary.
-        /* Wrote "true" in place of "NoVerify" */
-        if (Target->addPassesToEmitFile(PM, *OS, TargetMachine::CGFT_AssemblyFile, true, StartBeforeID,
-                                        StartAfterID, StopAfterID, MIR.get())) {
-            errs() << argv[0] << ": target does not support generation of this"
-            << " file type!\n";
-            return 1;
-        }
-
-        // Before executing passes, print the final values of the LLVM options.
-        cl::PrintOptionValues();
-
-        PM.run(*M);
-
-        outs() << svectorOS.str().str();
+  
+    SmallVector<char, 1024*1024*4> *smallVector = new SmallVector<char, 1024*1024*4>();
+    raw_svector_ostream svectorOS(*smallVector);
+    raw_pwrite_stream *OS = &svectorOS;
+  
+    // Ask the target to add backend passes as necessary.
+    /* Wrote "true" in place of "NoVerify" */
+    if (Target->addPassesToEmitFile(PM, *OS, FileType, true, nullptr,
+                                    nullptr, nullptr, MIR.get())) {
+        errs() << argv[0] << ": target does not support generation of this"
+        << " file type!\n";
+        return 1;
     }
-
-
+    
+    PM.run(*M);
+    //outs() << svectorOS.str().str();
+    
+    svectorOS.flush();
+    
+    outs() << "Generated the code.\n";
+    
+    ///////////////////////// Rtdyld Stuff //////////////////////////////
+    
+    // Instantiate a dynamic linker.
+    TrivialMemoryManager MemMgr;
+    RuntimeDyld Dyld(MemMgr, MemMgr);
+    
+    // FIXME: Preserve buffers until resolveRelocations time to work around a bug
+    //        in RuntimeDyldELF.
+    // This fixme should be fixed ASAP. This is a very brittle workaround.
+    std::vector<std::unique_ptr<MemoryBuffer>> InputBuffers;
+    
+    // Load the input memory buffer.
+    ErrorOr<std::unique_ptr<MemoryBuffer>> InputBuffer = MemoryBuffer::getMemBuffer(svectorOS.str());
+    ErrorOr<std::unique_ptr<ObjectFile>> MaybeObj(ObjectFile::createObjectFile((*InputBuffer)->getMemBufferRef()));
+    outs() << "InputBuffer created.\n";
+    
+    if (std::error_code EC = MaybeObj.getError()) {
+        errs() << "unable to create object file: '" + EC.message() + "'";
+        exit(1);
+    }
+    
+    ObjectFile &Obj = **MaybeObj;
+    InputBuffers.push_back(std::move(*InputBuffer));
+    
+    // Load the object file
+    Dyld.loadObject(Obj);
+    if (Dyld.hasError()) {
+        errs() << "Dyld error: " << Dyld.getErrorString();
+        exit(1);
+    }
+    
+    outs() << "Object file loaded.\n";
+    
+    // Resolve all the relocations we can.
+    Dyld.resolveRelocations();
+    // Clear instruction cache before code will be executed.
+    MemMgr.invalidateInstructionCache();
+    
+    // FIXME: Error out if there are unresolved relocations.
+    
+    // Get the address of the entry point (_main by default).
+    void *MainAddress = Dyld.getSymbolLocalAddress("_multByM");
+    if (!MainAddress) {
+        errs() << "no definition for '_multByM'";
+        exit(1);
+    }
+    
+    // Invalidate the instruction cache for each loaded function.
+    for (unsigned i = 0, e = MemMgr.FunctionMemory.size(); i != e; ++i) {
+        sys::MemoryBlock &Data = MemMgr.FunctionMemory[i];
+        // Make sure the memory is executable.
+        std::string ErrorStr;
+        sys::Memory::InvalidateInstructionCache(Data.base(), Data.size());
+        if (!sys::Memory::setExecutable(Data, &ErrorStr)) {
+            errs() << "unable to mark function executable: '" + ErrorStr + "'";
+            exit(1);
+        }
+    }
+    
+    // At this point, the function has been loaded.
+    
+    void (*multByM)(double *, double *) =
+    (void(*)(double *, double *)) uintptr_t(MainAddress);
+    
+    int n = readNValue(matrixName);
+    double *v = (double *) malloc(n * sizeof(double));
+    double *w = (double *) malloc(n * sizeof(double));
+    if (w == NULL || v == NULL) exit(1);
+    for (int i = 0; i < n; i++) {
+        v[i] = i;
+        w[i] = 0;
+    }
+    
+    /* run the function */
+    auto start2 = std::chrono::high_resolution_clock::now();
+    for(int i = 0; i < 5000; i++){
+        multByM(v, w);
+    }
+    auto end2 = std::chrono::high_resolution_clock::now();
+    
+    auto duration2 = std::chrono::duration_cast<std::chrono::microseconds>(end2 - start2).count();
+    outs() << "Run function duration (microseconds): \n" << duration2 / 5000.0 << "\n";
+    
+    
     llvm_shutdown();
     return 0;
 }
