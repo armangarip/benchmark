@@ -3,20 +3,43 @@
 #include <ctime>
 #include <fstream>
 #include <sstream>
+#include "llvm/IR/LLVMContext.h"
+#include "llvm/ADT/Triple.h"
+#include "llvm/Bitcode/ReaderWriter.h"
+#include "llvm/CodeGen/LinkAllCodegenComponents.h"
 #include "llvm/ExecutionEngine/GenericValue.h"
 #include "llvm/ExecutionEngine/Interpreter.h"
-#include "llvm/ADT/STLExtras.h"
+#include "llvm/ExecutionEngine/JIT.h"
+#include "llvm/ExecutionEngine/JITEventListener.h"
+#include "llvm/ExecutionEngine/JITMemoryManager.h"
 #include "llvm/ExecutionEngine/MCJIT.h"
-#include "llvm/IR/Constants.h"
-#include "llvm/IR/DerivedTypes.h"
+#include "llvm/ExecutionEngine/ObjectCache.h"
+#include "llvm/ExecutionEngine/SectionMemoryManager.h"
 #include "llvm/IR/IRBuilder.h"
-#include "llvm/IR/Instructions.h"
-#include "llvm/IR/LLVMContext.h"
 #include "llvm/IR/Module.h"
+#include "llvm/IR/Type.h"
+#include "llvm/IR/TypeBuilder.h"
 #include "llvm/IRReader/IRReader.h"
-#include "llvm/Support/SourceMgr.h"
+#include "llvm/Object/Archive.h"
+#include "llvm/Object/ObjectFile.h"
+#include "llvm/Support/CommandLine.h"
+#include "llvm/Support/Debug.h"
+#include "llvm/Support/DynamicLibrary.h"
+#include "llvm/Support/Format.h"
 #include "llvm/Support/ManagedStatic.h"
+#include "llvm/Support/MathExtras.h"
+#include "llvm/Support/Memory.h"
+#include "llvm/Support/MemoryBuffer.h"
+#include "llvm/Support/PluginLoader.h"
+#include "llvm/Support/PrettyStackTrace.h"
+#include "llvm/Support/Process.h"
+#include "llvm/Support/Program.h"
+#include "llvm/Support/Signals.h"
+#include "llvm/Support/SourceMgr.h"
 #include "llvm/Support/TargetSelect.h"
+#include "llvm/Support/raw_ostream.h"
+#include "llvm/Transforms/Instrumentation.h"
+#include <cerrno>
 
 using namespace llvm;
 
@@ -78,18 +101,17 @@ int main(int argc, char** argv) {
     LLVMContext Context;
     SMDiagnostic diag;
 
-    std::unique_ptr<Module> Owner = parseIRFile(
+    Module *M = ParseIRFile(
             "data/" + matrixName + "/" + matrixName + "_" + specType + "/generated_merged.ll", diag, Context);
-    if (!Owner) {
+    if (!M) {
         errs() << "No such matrix";
         return 1;
     }
 
 
-    Module *M = Owner.get();
     outs() << "Target: " << M->getTargetTriple() << "\n";
     M->materializeAllPermanently();
-    ExecutionEngine *EE = EngineBuilder(std::move(Owner))
+    ExecutionEngine *EE = EngineBuilder(M)
             .setOptLevel(optLevel)
             .setEngineKind(EngineKind::JIT)
             .create();
@@ -98,11 +120,11 @@ int main(int argc, char** argv) {
     auto end3 = std::chrono::high_resolution_clock::now();
 
 //    Test 1: FindFunctionNamed + getPointerToFunction
-//    auto start1 = std::chrono::high_resolution_clock::now();
-//    Function *func = EE->FindFunctionNamed("multByM");
-//    auto end1_1 = std::chrono::high_resolution_clock::now();
-//    void *rawptr = EE->getPointerToFunction(func);
-//    auto end1_2 = std::chrono::high_resolution_clock::now();
+    auto start1 = std::chrono::high_resolution_clock::now();
+    Function *func = EE->FindFunctionNamed("multByM");
+    auto end1_1 = std::chrono::high_resolution_clock::now();
+    void *rawptr = EE->getPointerToFunction(func);
+    auto end1_2 = std::chrono::high_resolution_clock::now();
 
     // Test 2: getPointerToNamedFunction
 //    auto start1 = std::chrono::high_resolution_clock::now();
@@ -110,9 +132,9 @@ int main(int argc, char** argv) {
 //    auto end1 = std::chrono::high_resolution_clock::now();
 
     // Test 3: getFunctionAddress
-    auto start1 = std::chrono::high_resolution_clock::now();
-    uint64_t rawptr = EE->getFunctionAddress("multByM");
-    auto end1 = std::chrono::high_resolution_clock::now();
+//    auto start1 = std::chrono::high_resolution_clock::now();
+//    uint64_t rawptr = EE->getFunctionAddress("multByM");
+//    auto end1 = std::chrono::high_resolution_clock::now();
 
     /*    std::vector<GenericValue> noargs;
     GenericValue GV = EE->runFunction(func, noargs);
@@ -138,12 +160,12 @@ int main(int argc, char** argv) {
     auto end2 = std::chrono::high_resolution_clock::now();
 
     //For test 1
-//    auto duration1_1 = std::chrono::duration_cast<std::chrono::nanoseconds>(end1_1 - start1).count();
-//    auto duration1_2 = std::chrono::duration_cast<std::chrono::nanoseconds>(end1_2 - end1_1).count();
-//    auto duration2 = std::chrono::duration_cast<std::chrono::nanoseconds>(end2 - start2).count();
-//    outs() << "FindFunctionNamed duration (nanoseconds): \n" << duration1_1 << "\n";
-//    outs() << "getPointerToFunction duration (nanoseconds): \n" << duration1_2 << "\n";
-//    outs() << "Run function duration (nanoseconds): \n" << duration2 / 5000.0 << "\n";
+    auto duration1_1 = std::chrono::duration_cast<std::chrono::nanoseconds>(end1_1 - start1).count();
+    auto duration1_2 = std::chrono::duration_cast<std::chrono::nanoseconds>(end1_2 - end1_1).count();
+    auto duration2 = std::chrono::duration_cast<std::chrono::nanoseconds>(end2 - start2).count();
+    outs() << "FindFunctionNamed duration (nanoseconds): \n" << duration1_1 << "\n";
+    outs() << "getPointerToFunction duration (nanoseconds): \n" << duration1_2 << "\n";
+    outs() << "Run function duration (nanoseconds): \n" << duration2 / 5000.0 << "\n";
 
     //For test 2
 //    auto duration1 = std::chrono::duration_cast<std::chrono::nanoseconds>(end1 - start1).count();
@@ -152,12 +174,12 @@ int main(int argc, char** argv) {
 //    outs() << "Run function duration (nanoseconds): \n" << duration2 / 5000.0 << "\n";
 
     //For test 3
-    auto duration1 = std::chrono::duration_cast<std::chrono::microseconds>(end1 - start1).count();
-    auto duration2 = std::chrono::duration_cast<std::chrono::microseconds>(end2 - start2).count();
+//    auto duration1 = std::chrono::duration_cast<std::chrono::microseconds>(end1 - start1).count();
+//    auto duration2 = std::chrono::duration_cast<std::chrono::microseconds>(end2 - start2).count();
     auto duration3 = std::chrono::duration_cast<std::chrono::microseconds>(end3 - start3).count();
 
-    outs() << "getFunctionAddress duration (microseconds): \n" << duration1 << "\n";
-    outs() << "Run function duration (microseconds): \n" << duration2 / 5000.0 << "\n";
+//    outs() << "getFunctionAddress duration (microseconds): \n" << duration1 << "\n";
+//    outs() << "Run function duration (microseconds): \n" << duration2 / 5000.0 << "\n";
     outs() << "Finalize duration (microseconds): \n" << duration3 << "\n";
 
     delete EE;

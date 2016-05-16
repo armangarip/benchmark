@@ -1,9 +1,9 @@
-cmake_minimum_required(VERSION 3.3)
+cmake_minimum_required(VERSION 2.8)
 project(benchmark)
 
 message(STATUS ${llvm_libs})
 
-find_package(LLVM REQUIRED CONFIG)
+find_package(LLVM 3.5.0 REQUIRED CONFIG)
 
 include_directories(${LLVM_INCLUDE_DIRS})
 add_definitions(${LLVM_DEFINITIONS})
